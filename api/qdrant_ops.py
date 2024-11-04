@@ -13,7 +13,7 @@ def connect_to_qdrant():
         if "aireas-local" not in [collection.name for collection in existing_collections]:
             connection.create_collection(
                 collection_name="aireas-local",
-                vectors_config=models.VectorParams(size=768, distance=models.Distance.DOT),
+                vectors_config=models.VectorParams(size=768, distance=models.Distance.COSINE),
             )
             print("Collection 'aireas-local' created successfully.")
         else:
