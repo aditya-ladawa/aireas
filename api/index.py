@@ -17,7 +17,7 @@ from typing import List
 from api.qdrant_cloud_ops import process_pdfs, qclient_, EMBEDDING_MODEL, QueryRequest
 
 # sql_ops imports
-from api.sql_ops import init_db, create_user, get_user_by_email, verify_password, UserCreate, UserLogin
+from api.sql_ops import init_db, create_user, get_user_by_email, verify_password, UserCreate, UserLogin, generate_jwt_token, validate_password_strength
 from fastapi.responses import JSONResponse
 
 
@@ -106,32 +106,71 @@ def retrieve(query_request: QueryRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/signup")
+@app.post("/api/signup", status_code=201)
 async def signup(user: UserCreate):
-    # Check if the email is already registered
-    existing_user = await get_user_by_email(user.email)
+    # Check if email already exists
+    existing_user = await get_user_by_email(user.email.lower())
     if existing_user:
-        raise HTTPException(status_code=400, detail="Email already registered.")
-
+        raise HTTPException(
+            status_code=400,
+            detail="This email is already registered. Please log in.",
+        )
+    
+    # Validate password strength
+    if not validate_password_strength(user.password):
+        raise HTTPException(
+            status_code=400,
+            detail="Password must contain at least 8 characters, including an uppercase letter, a number, and a special character.",
+        )
+    
     # Create the new user
-    new_user = await create_user(user.user_name, user.password, user.email)
-    return JSONResponse(
-        status_code=201,
-        content={"message": f"User {new_user.user_name} registered successfully."},
-    )
+    try:
+        new_user = await create_user(
+            user_name=user.name.strip(),
+            raw_password=user.password,
+            email=user.email.strip().lower(),
+        )
+        return JSONResponse(
+            content={"message": f"User {new_user.user_name} successfully registered."}
+        )
+    except Exception as e:
+        print(f"Error during signup: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred during signup. Please try again later.",
+        )
 
 
-@app.post("/login")
+@app.post("/api/login", status_code=200)
 async def login(user: UserLogin):
-    # Fetch the user by email
-    db_user = await get_user_by_email(user.email)
+    """
+    Authenticate a user. Validates email and password, and returns a JWT token upon success.
+    """
+    # Fetch user by email
+    db_user = await get_user_by_email(user.email.strip().lower())
     if not db_user:
-        raise HTTPException(status_code=404, detail="This email does not exist. Please sign up.")
-
-    # Verify the password
-    is_valid_password = await verify_password(user.password, db_user.password)
-    if not is_valid_password:
-        raise HTTPException(status_code=401, detail="Incorrect password. Please try again.")
-
-    return {"message": f"Welcome back, {db_user.user_name}!"}
-
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password.",
+        )
+    
+    # Verify password
+    if not await verify_password(user.password, db_user.password):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password.",
+        )
+    
+    # Generate JWT token
+    try:
+        token = generate_jwt_token(user_id=db_user.user_id, email=db_user.email)
+        return JSONResponse(
+            content={"message": "Login successful", "token": token}
+        )
+    except Exception as e:
+        # Log the exception if necessary
+        print(f"Error during login: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred during login. Please try again later.",
+        )
