@@ -11,10 +11,10 @@ from typing import List, Annotated
 from qdrant_client import QdrantClient
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_core.tools import StructuredTool, ToolException
-from qdrant_ops import connect_to_qdrant
+from qdrant_cloud_ops import connect_to_qdrant
 
 client = connect_to_qdrant()
-COLLECTION_NAME = 'aireas-local'
+COLLECTION_NAME = 'aireas-cloud'
 EMBEDDING_MODEL= GoogleGenerativeAIEmbeddings(model='models/text-embedding-004')
 
 class QdrantRetriever(BaseRetriever):
@@ -48,16 +48,6 @@ class QdrantRetriever(BaseRetriever):
                     
                 )
                 documents.append(document)
-
-        # if hasattr(search_result, 'points'):
-        #     for point in search_result.points:
-        #         document = {
-        #             'metadata':{"pdf_id": point.payload.get("pdf_id", ""), "score": point.score},
-        #             'page_content':point.payload.get("text", ""),
-                    
-        #         }
-        #         documents.append(document)
-
         return documents
 
 
@@ -72,44 +62,38 @@ Qretriever = QdrantRetriever(
 
 # Load other tools
 arxiv_search_tool = load_tools(["arxiv"])[0]
-tavily_search_tool = TavilySearchResults(max_results=2)
+
+
+tavily_search_tool = TavilySearchResults(max_results=3)
 
 # Web scraper class
-class WebScraper:
-    def __init__(self, urls: List[str]):
-        self.urls = urls
-
-    def scrape_webpages(self) -> str:
-        """Scrape the provided web pages for detailed information."""
-        try:
-            loader = WebBaseLoader(self.urls)
-            docs = loader.load()
-            return "\n\n".join(
-                [
-                    f'<Document name="{doc.metadata.get("title", "")}">\n{doc.page_content}\n</Document>'
-                    for doc in docs
-                ]
-            )
-        except ToolException as e:
-            return self._handle_error(e)
-
-    def _handle_error(self, error: ToolException) -> str:
-        return f"The following errors occurred during tool execution: `{error.args[0]}`"
+def scrape_webpages(urls: List[str]) -> str:
+    """Use requests and bs4 to scrape the provided web pages for detailed information."""
+    loader = WebBaseLoader(urls)
+    docs = loader.load()
+    return "\n\n".join(
+        [
+            f'<Document name="{doc.metadata.get("title", "")}">\n{doc.page_content}\n</Document>'
+            for doc in docs
+        ]
+    )
 
 web_scraper_tool = StructuredTool.from_function(
-    func=WebScraper.scrape_webpages,
-    handle_tool_error=WebScraper._handle_error
+    func=scrape_webpages,
+    handle_tool_error=True
 )
 
 # Python REPL tool
 repl = PythonREPL()
 
 def python_repl(
-    code: Annotated[str, "The Python code to execute to generate visualization."]):
-    """Execute Python code."""
+    code: Annotated[str, "The python code to execute to generate your chart."],
+):
+    """Use this to execute python code. If you want to see the output of a value,
+    you should print it out with `print(...)`. This is visible to the user."""
     try:
         result = repl.run(code)
-    except ToolException as e:
+    except BaseException as e:
         return f"Failed to execute. Error: {repr(e)}"
     return f"Successfully executed:\n```python\n{code}\n```\nStdout: {result}"
 

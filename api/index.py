@@ -7,20 +7,19 @@ from uuid import uuid4
 import os
 from pathlib import Path
 from dotenv import load_dotenv
-import xml.etree.ElementTree as ET
 
-# Import necessary modules
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from qdrant_client import QdrantClient
-from grobid_client.grobid_client import GrobidClient
 
-# Import local functions and models
-from api.qdrant_ops import connect_to_qdrant
-from api.grobid_ops import connect_to_grobid
-from api.helpers import *
-from api.pydantic_models import QueryRequest  # Ensure you have the correct model definition
 from typing import List
+
+from api.qdrant_cloud_ops import process_pdfs, qclient_, EMBEDDING_MODEL, QueryRequest
+
+# sql_ops imports
+from api.sql_ops import init_db, create_user, get_user_by_email, verify_password, UserCreate, UserLogin
+from fastapi.responses import JSONResponse
+
 
 # Load environment variables
 load_dotenv()
@@ -28,17 +27,14 @@ load_dotenv()
 # Initialize FastAPI
 app = FastAPI(docs_url="/api/docs", openapi_url="/api/openapi.json")
 
-# Embedding model
-EMBEDDING_MODEL = GoogleGenerativeAIEmbeddings(model='models/text-embedding-004')
+# Initialize the database at startup
+@app.on_event("startup")
+async def startup_event():
+    await init_db()
 
-# Collection name
-COLLECTION_NAME = 'aireas-local'
-
-# GROBID CLIENT
-grobid_client = connect_to_grobid()
-
-# Qdrant client
-qdrant_client = connect_to_qdrant()
+EMBEDDING_MODEL = EMBEDDING_MODEL
+COLLECTION_NAME = 'aireas-cloud'
+qdrant_client = qclient_
 
 # Set up CORS
 app.add_middleware(
@@ -108,4 +104,34 @@ def retrieve(query_request: QueryRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/signup")
+async def signup(user: UserCreate):
+    # Check if the email is already registered
+    existing_user = await get_user_by_email(user.email)
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Email already registered.")
+
+    # Create the new user
+    new_user = await create_user(user.user_name, user.password, user.email)
+    return JSONResponse(
+        status_code=201,
+        content={"message": f"User {new_user.user_name} registered successfully."},
+    )
+
+
+@app.post("/login")
+async def login(user: UserLogin):
+    # Fetch the user by email
+    db_user = await get_user_by_email(user.email)
+    if not db_user:
+        raise HTTPException(status_code=404, detail="This email does not exist. Please sign up.")
+
+    # Verify the password
+    is_valid_password = await verify_password(user.password, db_user.password)
+    if not is_valid_password:
+        raise HTTPException(status_code=401, detail="Incorrect password. Please try again.")
+
+    return {"message": f"Welcome back, {db_user.user_name}!"}
 
