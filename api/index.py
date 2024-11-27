@@ -1,4 +1,5 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Response, Request, Query
+
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
@@ -14,11 +15,20 @@ from qdrant_client import QdrantClient
 
 from typing import List
 
-from api.qdrant_cloud_ops import process_pdfs, qclient_, EMBEDDING_MODEL, QueryRequest
+from api.qdrant_cloud_ops import process_pdfs, qclient_, EMBEDDING_MODEL
 
 # sql_ops imports
-from api.sql_ops import init_db, create_user, get_user_by_email, verify_password, UserCreate, UserLogin, generate_jwt_token, validate_password_strength
+from api.sql_ops import init_db, create_user, get_user_by_email, verify_password, generate_jwt_token, validate_password_strength, get_user_by_id
 from fastapi.responses import JSONResponse
+from api.pydantic_models import *
+
+from api.chat_handlers import assign_chat_topic_chain
+
+from fastapi.security import OAuth2PasswordBearer
+
+import jwt  # pyjwt library
+from jwt import ExpiredSignatureError, InvalidTokenError
+
 
 
 # Load environment variables
@@ -32,9 +42,13 @@ app = FastAPI(docs_url="/api/docs", openapi_url="/api/openapi.json")
 async def startup_event():
     await init_db()
 
+
+SECRET_KEY = os.environ.get('JWT_SECRET_KEY')
+ALGORITHM = "HS256"
 EMBEDDING_MODEL = EMBEDDING_MODEL
 COLLECTION_NAME = 'aireas-cloud'
 qdrant_client = qclient_
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/login")
 
 # Set up CORS
 app.add_middleware(
@@ -55,9 +69,24 @@ os.makedirs(metas_dir, exist_ok=True)
 # Mount static files
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
-@app.get("/api/healthchecker")
-def healthchecker():
-    return {"status": "success", "message": "FastAPI and Next.js are integrated"}
+
+@app.get("/api/authenticate")
+async def authenticate_user(token: str = Query(..., description="JWT token")):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = payload.get("user_id")
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="Invalid token payload")
+        
+        user = await get_user_by_id(user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        return {"authenticated": True, "user": user}
+    except ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired")
+    except InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
 @app.post("/api/upload")
 async def upload_files(files: List[UploadFile] = File(...)):
@@ -73,6 +102,17 @@ async def upload_files(files: List[UploadFile] = File(...)):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/get_uploaded_files")
+async def get_files():
+    try:
+        files = os.listdir(static_dir)
+        
+        files = [file for file in files if os.path.isfile(os.path.join(static_dir, file))]
+        
+        return JSONResponse(content={"files": files}, status_code=200)
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
 
 @app.post('/api/retrieve')
 def retrieve(query_request: QueryRequest):
@@ -105,10 +145,8 @@ def retrieve(query_request: QueryRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.post("/api/signup", status_code=201)
 async def signup(user: UserCreate):
-    # Check if email already exists
     existing_user = await get_user_by_email(user.email.lower())
     if existing_user:
         raise HTTPException(
@@ -123,54 +161,66 @@ async def signup(user: UserCreate):
             detail="Password must contain at least 8 characters, including an uppercase letter, a number, and a special character.",
         )
     
-    # Create the new user
     try:
-        new_user = await create_user(
+        new_user = create_user(
             user_name=user.name.strip(),
             raw_password=user.password,
             email=user.email.strip().lower(),
         )
+
         return JSONResponse(
-            content={"message": f"User {new_user.user_name} successfully registered."}
+            content={
+                "message": f"User {new_user.user_name} successfully registered.",
+            }
         )
     except Exception as e:
-        print(f"Error during signup: {e}")
         raise HTTPException(
             status_code=500,
             detail="An unexpected error occurred during signup. Please try again later.",
         )
 
-
 @app.post("/api/login", status_code=200)
-async def login(user: UserLogin):
-    """
-    Authenticate a user. Validates email and password, and returns a JWT token upon success.
-    """
-    # Fetch user by email
-    db_user = await get_user_by_email(user.email.strip().lower())
-    if not db_user:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid email or password.",
-        )
-    
-    # Verify password
-    if not await verify_password(user.password, db_user.password):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid email or password.",
-        )
-    
-    # Generate JWT token
+async def login(user: UserLogin, response: Response):
     try:
+        # Fetch user from the database by email
+        db_user = await get_user_by_email(user.email.strip().lower())
+        if db_user is None or not verify_password(user.password, db_user.password):
+            raise HTTPException(status_code=401, detail="Invalid email or password.")
+        
+        # Generate JWT token
         token = generate_jwt_token(user_id=db_user.user_id, email=db_user.email)
-        return JSONResponse(
-            content={"message": "Login successful", "token": token}
+
+        # Set the token as an HTTP-only cookie
+        response.set_cookie(
+            key="auth_token",
+            value=token,
+            httponly=True,  # Prevent JavaScript access
+            secure=False,   # Set to True in production with HTTPS
+            samesite="Strict",  # Helps prevent CSRF attacks
+            max_age=60 * 60,  # Token expiry time (1 hour)
         )
+
+        # Return the login success response
+        return JSONResponse(content={"message": "Login successful", "token": token})
+    
     except Exception as e:
-        # Log the exception if necessary
-        print(f"Error during login: {e}")
         raise HTTPException(
             status_code=500,
             detail="An unexpected error occurred during login. Please try again later.",
         )
+
+@app.post('/api/assign_topic')
+async def assign_topic(request: AssignTopic):
+    try:
+        query = request.query
+        if not query.strip():
+            raise HTTPException(status_code=400, detail="user_query is required and cannot be empty.")
+
+        assigned_topic = assign_chat_topic_chain.invoke(query)
+
+        return {"assigned_topic": assigned_topic}
+
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
