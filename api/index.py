@@ -30,25 +30,18 @@ import jwt
 from jwt.exceptions import InvalidTokenError, ExpiredSignatureError
 from jwt import decode
 
+from starlette.middleware.base import BaseHTTPMiddleware
+from datetime import datetime, timedelta
+
+
+from sqlalchemy.exc import SQLAlchemyError
+
+import re
+
+
 
 # Load environment variables
 load_dotenv()
-
-# Initialize FastAPI
-app = FastAPI(docs_url="/api/docs", openapi_url="/api/openapi.json")
-
-
-# Set up CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins = [
-        "http://localhost:3000",
-        "https://localhost:3000"
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 
 SECRET_KEY = os.environ.get('JWT_SECRET_KEY')
@@ -57,11 +50,78 @@ EMBEDDING_MODEL = EMBEDDING_MODEL
 COLLECTION_NAME = 'aireas-cloud'
 qdrant_client = qclient_
 
-# Initialize the database at startup
-@app.on_event("startup")
-async def startup_event():
-    await init_db()
 
+# Initialize FastAPI
+app = FastAPI(docs_url="/api/docs", openapi_url="/api/openapi.json")
+
+# Set up CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins = ["http://localhost:3000", "https://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class UserAuthMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app, secret_key: str, algorithm: str):
+        super().__init__(app)
+        self.secret_key = secret_key
+        self.algorithm = algorithm
+
+    async def dispatch(self, request: Request, call_next):
+        # List of routes that don't require authentication
+        unprotected_routes = [
+            "/api/login", 
+            "/api/signup", 
+            "/api/logout",
+            '/api/docs',
+            '/api/openapi.json',
+        ]
+
+        # Check for dynamic routes or unprotected routes
+        for route in unprotected_routes:
+            # Check if the route matches any unprotected route
+            if re.fullmatch(route, request.url.path):
+                response = await call_next(request)
+                return response
+
+        # Handle generic dynamic routes (e.g., /api/conversations/{conversation_id}, /api/users/{user_id}, etc.)
+        if re.fullmatch(r"/api/.*/\w+", request.url.path):  # Generic pattern for dynamic routes
+            response = await call_next(request)
+            return response
+
+        # If no match, proceed with authentication checks
+        token = request.cookies.get("auth_token")
+        if not token:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+
+        try:
+            payload = decode(token, self.secret_key, algorithms=[self.algorithm])
+            exp = payload.get("exp")
+            if exp and datetime.utcfromtimestamp(exp) < datetime.utcnow():
+                raise HTTPException(status_code=401, detail="Token has expired")
+            
+            user = {
+                "user_id": payload.get("user_id"),
+                "email": payload.get("email")
+            }
+            request.state.user = user
+
+        except ExpiredSignatureError:
+            raise HTTPException(status_code=401, detail="Token has expired")
+        except InvalidTokenError:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        except DecodeError:
+            raise HTTPException(status_code=400, detail="Token is malformed or invalid")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+
+        # Proceed with the request if authentication passes
+        response = await call_next(request)
+        return response
+
+app.add_middleware(UserAuthMiddleware, secret_key=SECRET_KEY, algorithm=ALGORITHM)
 
 # Define directories for file uploads
 static_dir = Path("api/static/files")
@@ -73,57 +133,24 @@ os.makedirs(metas_dir, exist_ok=True)
 # Mount static files
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
-def get_current_user(request: Request):
-    # Retrieve the token from cookies
-    token = request.cookies.get("auth_token")
-    if not token:
+
+# Initialize the database at startup
+@app.on_event("startup")
+async def startup_event():
+    await init_db()
+
+
+def get_authenticated_user(request: Request):
+    if not request.state.user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Not authenticated",
-            headers={"WWW-Authenticate": "Bearer"},
         )
-
-    try:
-        # Decode the JWT token with automatic expiration verification
-        payload = decode(
-            token, SECRET_KEY, algorithms=[ALGORITHM], options={"verify_exp": True}
-        )
-        user_id: str = payload.get("user_id")
-        email: str = payload.get("email")
-
-        # Validate the presence of user_id and email
-        if not user_id or not email:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid token: missing user_id or email",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-
-        # Return user details as a structured response
-        return {"user_id": user_id, "email": email}
-
-    except ExpiredSignatureError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token has expired",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    except InvalidTokenError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token is invalid",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Error decoding token: {str(e)}",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+    return request.state.user
 
 
 @app.post("/api/upload")
-async def upload_files(files: List[UploadFile] = File(...), current_user: dict = Depends(get_current_user)):
+async def upload_files(files: List[UploadFile] = File(...), current_user: dict = Depends(get_authenticated_user)):
     """Uploads PDF files, processes them with GROBID, and stores their embeddings."""
     try:
         uploaded_files_info = await process_pdfs(files, qdrant_client, COLLECTION_NAME, EMBEDDING_MODEL, upload_dir_=static_dir)
@@ -133,7 +160,7 @@ async def upload_files(files: List[UploadFile] = File(...), current_user: dict =
 
 
 @app.get("/api/get_uploaded_files")
-async def get_files(current_user: dict = Depends(get_current_user)):
+async def get_files(current_user: dict = Depends(get_authenticated_user)):
     try:
         files = os.listdir(static_dir)
         files = [file for file in files if os.path.isfile(os.path.join(static_dir, file))]
@@ -143,7 +170,7 @@ async def get_files(current_user: dict = Depends(get_current_user)):
 
 
 @app.post('/api/retrieve')
-def retrieve(query_request: QueryRequest, current_user: dict = Depends(get_current_user)):
+def retrieve(query_request: QueryRequest, current_user: dict = Depends(get_authenticated_user)):
     """Retrieves relevant PDF information based on the query."""
     try:
         # Get the embeddings for the query
@@ -225,22 +252,42 @@ async def login(user: UserLogin, response: Response):
             key="auth_token",
             value=token,
             httponly=True,
+            secure=False,
             samesite='Strict'
         )
 
-
-        # print(response._headers)
-
-        # Return the response
         return {"message": "Login successful"}
 
+    except SQLAlchemyError:
+        raise HTTPException(status_code=500, detail="Database error")
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=str(e),
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+
+@app.get('/api/get_auth_user')
+async def get_active_user(current_user: dict = Depends(get_authenticated_user)):
+    return {'user': current_user}
+
+
+@app.post("/api/logout")
+async def logout(response: Response):
+    try:
+        response.set_cookie(
+            key="auth_token",
+            value="",  # Clear the cookie value
+            expires="Thu, 01 Jan 1994 00:00:00 GMT",  # Past date
+            max_age=0,  # Immediately expire
+            httponly=True,
+            secure=False,  # True in production
+            samesite="Strict",
+            path="/"  # Match the login cookie path
         )
+        return {"message": "Logout successful"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An error occurred during logout: {str(e)}")
+
+
 @app.post('/api/assign_topic')
-async def assign_topic(request: AssignTopic, current_user: dict = Depends(get_current_user)):
+async def assign_topic(request: AssignTopic, current_user: dict = Depends(get_authenticated_user)):
     try:
         query = request.query
         if not query.strip():
