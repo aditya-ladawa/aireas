@@ -2,8 +2,8 @@ from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from typing_extensions import List, Optional, Union, TypedDict, Literal, Dict, Literal, Annotated
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.messages import trim_messages
-from token_counter import tiktoken_counter
-
+from .token_counter import tiktoken_counter
+from langchain.schema import SystemMessage, HumanMessage
 
 
 
@@ -136,8 +136,6 @@ def rephrase_chain(llm):
     
     return rephrase_chain
 
-from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain.schema import SystemMessage, HumanMessage
 
 def get_plan_chain(llm):
     few_shot_rewoo = """
@@ -199,3 +197,18 @@ def get_plan_chain(llm):
 
 
 
+def assign_chat_topic(llm):
+
+    template = """
+        "You are an expert in assigning concise topics to conversations. The user provides their focus area, "
+        "and you assign a relevant topic in 5 words or less. "
+        "Here is the user's input:\n\n"
+        f"{user_input}\n\n"
+        "What is the best topic for this conversation? Provide only the topic without any extra text."
+    """
+
+    prompt_template = ChatPromptTemplate.from_template(template=template)
+
+    assign_chat_topic_chain = prompt_template | llm | StrOutputParser()
+
+    return assign_chat_topic_chain

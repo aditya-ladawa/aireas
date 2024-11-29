@@ -15,7 +15,7 @@ def tiktoken_counter(messages: List[BaseMessage]) -> int:
 
     For simplicity only supports str Message.contents.
     """
-    num_tokens = 3  # every reply is primed with <|start|>assistant<|message|>
+    num_tokens = 3
     tokens_per_message = 3
     tokens_per_name = 1
     for msg in messages:

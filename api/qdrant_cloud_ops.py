@@ -17,9 +17,6 @@ from pydantic import BaseModel
 load_dotenv()
 
 
-class QueryRequest(BaseModel):
-    query: str
-    top_k: int = 2
 
 
 llm_for_retrievel = ChatGroq(model='llama-3.1-70b-versatile')
@@ -60,6 +57,8 @@ def connect_to_qdrant():
             print(f"Connection error: {e}")
             _qdrant_client = None
     return _qdrant_client
+
+
 
 async def process_pdfs(files, qclient_, collection_name, emb_model, upload_dir_):
     """

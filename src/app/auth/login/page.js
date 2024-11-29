@@ -2,9 +2,9 @@
 
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
+import axios from 'axios';
 
 const BASE_URL = process.env.NEXT_PUBLIC_VERCEL_URL || 'http://localhost:3000';
-
 
 const InputField = ({ label, type, name, value, onChange, error, placeholder }) => (
   <div className="mb-4">
@@ -54,41 +54,40 @@ export default function LogIn() {
     setErrors(newErrors);
     return Object.keys(newErrors).length === 0;
   };
-
   const handleSubmit = async (e) => {
     e.preventDefault();
     if (!validateForm()) return;
-
+  
     setLoading(true);
     setApiError('');
-
+  
     try {
-      const response = await fetch(`${BASE_URL}/api/login`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(formData),
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        console.log(data.message);
-        router.push('/dashboard');
-      } else {
-        const errorData = await response.json();
-        setApiError(errorData.detail || 'An error occurred. Please try again.');
-      }
+      const response = await axios.post(
+        `${BASE_URL}/api/login`,
+        formData,
+        {
+          withCredentials: true, // Ensure cookies are sent and received
+        }
+      );
+  
+      router.push('/dashboard'); // Redirect to the dashboard after successful login
     } catch (error) {
-      setApiError('Something went wrong. Please try again.');
+      if (error.response) {
+        console.log('API Error:', error.response.data); // Log API error response
+        setApiError(error.response.data.detail || 'An error occurred. Please try again.');
+      } else {
+        console.log('Axios Error:', error.message); // Log actual Axios error
+        setApiError('Something went wrong. Please try again.');
+      }
     } finally {
       setLoading(false);
     }
   };
-
+  
   const handleSignUpClick = () => router.push('/auth/signup');
 
   return (
     <div className="min-h-screen flex flex-col bg-gradient-to-br from-gray-900 via-gray-800 to-black">
-      {/* Login Form Section */}
       <section className="flex-1 py-12 px-6 bg-gradient-to-r from-gray-800 via-black to-gray-900">
         <div className="max-w-lg mx-auto bg-gray-700 p-8 rounded-xl shadow-lg">
           <h2 className="text-3xl sm:text-4xl font-light text-transparent bg-clip-text bg-gradient-to-r from-white to-cyan-300 text-center mb-8">
@@ -128,7 +127,6 @@ export default function LogIn() {
         </div>
       </section>
 
-      {/* Footer Section */}
       <footer className="bg-gradient-to-r from-gray-800 via-black to-gray-900 py-8 text-center text-white">
         <p className="text-lg">
           Don't have an account yet?{' '}

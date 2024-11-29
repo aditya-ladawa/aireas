@@ -38,12 +38,9 @@ from sqlalchemy.exc import SQLAlchemyError
 
 import re
 
-
-
-# Load environment variables
 load_dotenv()
 
-
+# Services
 SECRET_KEY = os.environ.get('JWT_SECRET_KEY')
 ALGORITHM = "HS256"
 EMBEDDING_MODEL = EMBEDDING_MODEL
@@ -70,7 +67,6 @@ class UserAuthMiddleware(BaseHTTPMiddleware):
         self.algorithm = algorithm
 
     async def dispatch(self, request: Request, call_next):
-        # List of routes that don't require authentication
         unprotected_routes = [
             "/api/login", 
             "/api/signup", 
@@ -79,19 +75,15 @@ class UserAuthMiddleware(BaseHTTPMiddleware):
             '/api/openapi.json',
         ]
 
-        # Check for dynamic routes or unprotected routes
         for route in unprotected_routes:
-            # Check if the route matches any unprotected route
             if re.fullmatch(route, request.url.path):
                 response = await call_next(request)
                 return response
 
-        # Handle generic dynamic routes (e.g., /api/conversations/{conversation_id}, /api/users/{user_id}, etc.)
-        if re.fullmatch(r"/api/.*/\w+", request.url.path):  # Generic pattern for dynamic routes
+        if re.fullmatch(r"/api/.*/\w+", request.url.path):
             response = await call_next(request)
             return response
 
-        # If no match, proceed with authentication checks
         token = request.cookies.get("auth_token")
         if not token:
             raise HTTPException(status_code=401, detail="Not authenticated")
@@ -117,7 +109,6 @@ class UserAuthMiddleware(BaseHTTPMiddleware):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
-        # Proceed with the request if authentication passes
         response = await call_next(request)
         return response
 
@@ -151,7 +142,6 @@ def get_authenticated_user(request: Request):
 
 @app.post("/api/upload")
 async def upload_files(files: List[UploadFile] = File(...), current_user: dict = Depends(get_authenticated_user)):
-    """Uploads PDF files, processes them with GROBID, and stores their embeddings."""
     try:
         uploaded_files_info = await process_pdfs(files, qdrant_client, COLLECTION_NAME, EMBEDDING_MODEL, upload_dir_=static_dir)
         return {"uploaded_files": uploaded_files_info}
@@ -301,3 +291,5 @@ async def assign_topic(request: AssignTopic, current_user: dict = Depends(get_au
         raise e
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
