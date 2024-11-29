@@ -16,8 +16,10 @@ load_dotenv()
 
 Base = declarative_base()
 
-# Password hashing context
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+JWT_SECRET_KEY = os.environ.get('JWT_SECRET_KEY')
+
 
 class User(Base):
     __tablename__ = "users"
@@ -30,12 +32,10 @@ DATABASE_URL = "sqlite+aiosqlite:///./users.db"
 engine = create_async_engine(DATABASE_URL, echo=False)
 async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
-# Initialize database
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-# Create user
 async def create_user(user_name: str, raw_password: str, email: str):
     async with async_session() as session:
         hashed_password = pwd_context.hash(raw_password)
@@ -44,7 +44,6 @@ async def create_user(user_name: str, raw_password: str, email: str):
         await session.commit()
         return new_user
 
-# Fetch user by email
 async def get_user_by_email(email: str):
     async with async_session() as session:
         stmt = select(User).where(User.email == email)
@@ -57,18 +56,13 @@ async def get_user_by_id(user_id):
         user = result.scalar_one_or_none()
         return user
 
-# Verify password
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
 
-# Validate password strength
 def validate_password_strength(password: str) -> bool:
     pattern = r"^(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*])[A-Za-z\d!@#$%^&*]{8,}$"
     return bool(re.match(pattern, password))
 
-
-JWT_SECRET_KEY = os.environ.get('JWT_SECRET_KEY')
-# Generate JWT Token
 def generate_jwt_token(user_id: str, email: str) -> str:
     payload = {
         "user_id": user_id,

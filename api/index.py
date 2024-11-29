@@ -38,6 +38,9 @@ from sqlalchemy.exc import SQLAlchemyError
 
 import re
 
+import traceback
+
+
 load_dotenv()
 
 # Services
@@ -46,20 +49,22 @@ ALGORITHM = "HS256"
 EMBEDDING_MODEL = EMBEDDING_MODEL
 COLLECTION_NAME = 'aireas-cloud'
 qdrant_client = qclient_
+APIS = os.path.join(os.getcwd(), 'api')
 
 
 # Initialize FastAPI
-app = FastAPI(docs_url="/api/docs", openapi_url="/api/openapi.json")
+app = FastAPI(docs_url="/api/docs", openapi_url="/api/openapi.json", debug=True)
 
 # Set up CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins = ["http://localhost:3000", "https://localhost:3000"],
+    allow_origins=["http://localhost:3000", "https://localhost:3000"],  # Update as per your frontend URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Define the UserAuthMiddleware class
 class UserAuthMiddleware(BaseHTTPMiddleware):
     def __init__(self, app, secret_key: str, algorithm: str):
         super().__init__(app)
@@ -68,22 +73,25 @@ class UserAuthMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         unprotected_routes = [
-            "/api/login", 
-            "/api/signup", 
+            "/api/login",
+            "/api/signup",
             "/api/logout",
-            '/api/docs',
-            '/api/openapi.json',
+            "/api/docs",
+            "/api/openapi.json",
         ]
 
+        # Allow unprotected routes without authentication
         for route in unprotected_routes:
             if re.fullmatch(route, request.url.path):
                 response = await call_next(request)
                 return response
 
+        # Example regex for routes to skip authentication
         if re.fullmatch(r"/api/.*/\w+", request.url.path):
             response = await call_next(request)
             return response
 
+        # Extract token from cookies
         token = request.cookies.get("auth_token")
         if not token:
             raise HTTPException(status_code=401, detail="Not authenticated")
@@ -93,33 +101,85 @@ class UserAuthMiddleware(BaseHTTPMiddleware):
             exp = payload.get("exp")
             if exp and datetime.utcfromtimestamp(exp) < datetime.utcnow():
                 raise HTTPException(status_code=401, detail="Token has expired")
-            
+
+            # Add user data to request state
             user = {
                 "user_id": payload.get("user_id"),
-                "email": payload.get("email")
+                "email": payload.get("email"),
             }
             request.state.user = user
 
-        except ExpiredSignatureError:
-            raise HTTPException(status_code=401, detail="Token has expired")
-        except InvalidTokenError:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        except DecodeError:
-            raise HTTPException(status_code=400, detail="Token is malformed or invalid")
+        except ExpiredSignatureError as e:
+            raise HTTPException(status_code=401, detail=f"Token expired: {str(e)}")
+        except InvalidTokenError as e:
+            raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
+        except DecodeError as e:
+            raise HTTPException(status_code=400, detail=f"Malformed token: {str(e)}")
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
+        # Continue to the next middleware or route handler
         response = await call_next(request)
         return response
 
-app.add_middleware(UserAuthMiddleware, secret_key=SECRET_KEY, algorithm=ALGORITHM)
+# Add UserAuthMiddleware to the application
+app.add_middleware(
+    UserAuthMiddleware,
+    secret_key=SECRET_KEY,
+    algorithm=ALGORITHM,
+)
+
+
+import traceback
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """
+    Custom handler for HTTP exceptions to structure the error response.
+    """
+    # Provide detailed error information for debugging
+    error_detail = {
+        "detail": exc.detail,
+        "status_code": exc.status_code,
+        "message": "An error occurred during the request.",
+    }
+
+    # Include stack trace if in debug mode
+    if app.debug:
+        error_detail["stack_trace"] = traceback.format_exc()
+
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=error_detail,
+    )
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """
+    Custom handler for uncaught exceptions.
+    """
+    error_detail = {
+        "detail": str(exc),
+        "status_code": 500,
+        "message": "Internal server error occurred.",
+    }
+
+    # Include stack trace if in debug mode
+    if app.debug:
+        error_detail["stack_trace"] = traceback.format_exc()
+
+    return JSONResponse(
+        status_code=500,
+        content=error_detail,
+    )
 
 # Define directories for file uploads
-static_dir = Path("api/static/files")
+static_dir = Path("api/static/")
 static_dir.mkdir(exist_ok=True)
 
-metas_dir = "api/metas/"
-os.makedirs(metas_dir, exist_ok=True)
+# metas_dir = "api/metas/"
+# os.makedirs(metas_dir, exist_ok=True)
 
 # Mount static files
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
@@ -142,19 +202,61 @@ def get_authenticated_user(request: Request):
 
 @app.post("/api/upload")
 async def upload_files(files: List[UploadFile] = File(...), current_user: dict = Depends(get_authenticated_user)):
+    """
+    Upload and process PDF files for the current authenticated user.
+    """
     try:
-        uploaded_files_info = await process_pdfs(files, qdrant_client, COLLECTION_NAME, EMBEDDING_MODEL, upload_dir_=static_dir)
-        return {"uploaded_files": uploaded_files_info}
+        # Retrieve user information from the current authenticated user
+        user_id = current_user.get("user_id")
+        email = current_user.get("email")
+        if not user_id or not email:
+            raise HTTPException(status_code=401, detail="User authentication failed.")
+
+        # Define the user's directory
+        user_storage_base = os.path.join(APIS, "users_storage")
+        user_dir = os.path.join(user_storage_base, user_id)
+
+        # Process uploaded files
+        result = await process_pdfs(
+            files=files,
+            qclient_=qclient_,
+            collection_name="aireas-cloud",
+            emb_model=EMBEDDING_MODEL,
+            user_id=user_id,
+            email=email,
+            user_dir=user_dir,
+        )
+
+        return result
+
+    except HTTPException as e:
+        print(f"HTTPException: {e.detail}")
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Unexpected error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
 
 @app.get("/api/get_uploaded_files")
 async def get_files(current_user: dict = Depends(get_authenticated_user)):
     try:
-        files = os.listdir(static_dir)
-        files = [file for file in files if os.path.isfile(os.path.join(static_dir, file))]
+        # Retrieve user-specific storage directory
+        user_id = current_user.get("user_id")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="User authentication failed.")
+
+        user_storage_base = os.path.join(APIS, "users_storage")
+        user_dir = os.path.join(user_storage_base, user_id)
+
+        if not os.path.exists(user_dir):
+            return JSONResponse(content={"files": [], "message": "No files found."}, status_code=200)
+
+        files = [
+            file for file in os.listdir(user_dir) if os.path.isfile(os.path.join(user_dir, file))
+        ]
+
         return JSONResponse(content={"files": files}, status_code=200)
+
     except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
@@ -230,12 +332,10 @@ async def signup(user: UserCreate):
 @app.post("/api/login", status_code=200)
 async def login(user: UserLogin, response: Response):
     try:
-        # Fetch user from the database
         db_user = await get_user_by_email(user.email.strip().lower())
         if db_user is None or not verify_password(user.password, db_user.password):
             raise HTTPException(status_code=401, detail="Invalid email or password.")
 
-        # Generate the JWT token
         token = generate_jwt_token(user_id=db_user.user_id, email=db_user.email)
 
         response.set_cookie(
@@ -263,13 +363,13 @@ async def logout(response: Response):
     try:
         response.set_cookie(
             key="auth_token",
-            value="",  # Clear the cookie value
-            expires="Thu, 01 Jan 1994 00:00:00 GMT",  # Past date
-            max_age=0,  # Immediately expire
+            value="", 
+            expires="Thu, 01 Jan 1994 00:00:00 GMT",
+            max_age=0, 
             httponly=True,
-            secure=False,  # True in production
+            secure=False,
             samesite="Strict",
-            path="/"  # Match the login cookie path
+            path="/",
         )
         return {"message": "Logout successful"}
     except Exception as e:

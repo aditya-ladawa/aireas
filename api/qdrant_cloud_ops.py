@@ -13,6 +13,11 @@ from langchain_groq import ChatGroq
 from typing import Dict, List, TypedDict
 from langchain_core.documents import Document
 from pydantic import BaseModel
+import shutil
+import aiofiles
+from qdrant_client.http.models import UpdateStatus
+
+
 
 load_dotenv()
 
@@ -27,7 +32,7 @@ URL = os.environ.get('QDRANT_URL')
 
 
 
-_qdrant_client = None  # Global variable to store the client
+_qdrant_client = None
 
 def connect_to_qdrant():
     global _qdrant_client
@@ -60,74 +65,91 @@ def connect_to_qdrant():
 
 
 
-async def process_pdfs(files, qclient_, collection_name, emb_model, upload_dir_):
+async def process_pdfs(files, qclient_, collection_name, emb_model, user_id, email, user_dir):
     """
-    Process uploaded PDF files, extracting text, splitting into chunks, embedding, and upserting to Qdrant.
-
-    Args:
-        files (list[UploadFile]): List of PDF files to process.
-        qclient_ (QdrantClient): Qdrant client instance for vector database operations.
-        collection_name (str): Name of the Qdrant collection to upsert points into.
-        emb_model (EmbeddingModel): Model instance for generating embeddings.
-        upload_dir_ (str): Directory path to save the uploaded PDF files.
-
-    Returns:
-        dict: Information about uploaded files, including chunk count and upsert response.
+    Process uploaded PDF files, extract text, generate embeddings, and upsert them into Qdrant.
     """
     uploaded_files_info = {}
+    errors = []  # List to collect errors
+
+    os.makedirs(user_dir, exist_ok=True)
 
     for file in files:
-        # Convert the filename to lowercase
         filename_lower = file.filename.lower()
+        file_path = os.path.join(user_dir, filename_lower)
 
-        # Save the uploaded PDF file with lowercase filename
-        file_path = os.path.join(upload_dir_, filename_lower)
-        os.makedirs(upload_dir_, exist_ok=True)  # Ensure the directory exists
+        try:
+            if os.path.exists(file_path):
+                print(f"File {filename_lower} already exists. Skipping vectorization.")
+                continue
 
-        # Check if the file already exists
-        if os.path.exists(file_path):
-            print(f"Skipping {filename_lower}: already exists in {upload_dir_}.")
-            continue  # Skip to the next file if the PDF already exists
+            with open(file_path, "wb") as f:
+                content = await file.read()
+                f.write(content)
+            print(f"PDF saved to: {file_path}")
+        except Exception as e:
+            error_message = f"Failed to save {filename_lower}: {str(e)}"
+            print(error_message)
+            errors.append({"file": filename_lower, "error": error_message})
+            continue
 
-        with open(file_path, "wb") as f:
-            f.write(await file.read())
-        print(f"PDF saved to: {file_path}")
+        try:
+            pdf_text = extract_text_from_pdf(file_path)
 
-        # Extract text from the PDF
-        pdf_text = extract_text_from_pdf(file_path)
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=2100, chunk_overlap=210)
+            text_chunks = text_splitter.split_text(pdf_text)
 
-        # Split the text into chunks
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=2100, chunk_overlap=210)
-        text_chunks = text_splitter.split_text(pdf_text)
+            try:
+                embeddings = emb_model.embed_documents(text_chunks)
+            except Exception as e:
+                error_message = f"Embedding failed for {filename_lower}: {str(e)}"
+                print(error_message)
+                os.remove(file_path)  # Remove the file if vectorization fails
+                errors.append({"file": filename_lower, "error": error_message})
+                continue  # Skip to the next file
 
-        # Generate embeddings for the text chunks
-        embeddings = emb_model.embed_documents(text_chunks)
+            pdf_id = filename_lower  
+            points = [
+                models.PointStruct(
+                    id=str(uuid4()),
+                    payload={
+                        "metadata": {
+                            "pdf_id": pdf_id,
+                            "associated_user": user_id,
+                            "associated_user_email": email,
+                        },
+                        "text": text_chunks[i],
+                    },
+                    vector=embedding,
+                )
+                for i, embedding in enumerate(embeddings)
+            ]
 
-        # Use lowercase filename as pdf_id
-        pdf_id = filename_lower
-        points = [
-            models.PointStruct(
-                id=str(uuid4()),  # Ensure unique ID by using a UUID
-                payload={
-                    'metadata': {'pdf_id': pdf_id},
-                    "text": text_chunks[i]
-                },
-                vector=embedding  # Ensure this is a list
-            )
-            for i, embedding in enumerate(embeddings)
-        ]
+            upsert_response = qclient_.upsert(collection_name=collection_name, points=points)
 
-        # Upsert points into Qdrant collection
-        upsert_response = qclient_.upsert(collection_name=collection_name, points=points)
+            if upsert_response.status != UpdateStatus.COMPLETED:
+                error_message = f"Upsert failed for {filename_lower}. Response: {upsert_response}"
+                print(error_message)
+                os.remove(file_path)
+                errors.append({"file": filename_lower, "error": error_message})
+                continue
 
-        # Store the response information
+        except Exception as e:
+            error_message = f"Error processing {filename_lower}: {str(e)}"
+            print(error_message)
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            errors.append({"file": filename_lower, "error": error_message})
+            continue  # Skip to the next file
+
         uploaded_files_info[filename_lower] = {
             "file_name": filename_lower,
             "total_chunks": len(text_chunks),
-            "upsert_response": upsert_response
+            "upsert_response": upsert_response,
         }
 
-    return uploaded_files_info
+    return {"uploaded_files": uploaded_files_info, "errors": errors}
+
 
 
 def extract_text_from_pdf(file_path) -> str:
@@ -137,8 +159,6 @@ def extract_text_from_pdf(file_path) -> str:
         text += page.get_text()
     pdf_document.close()
     return text
-
-
 
 
 qclient_ = connect_to_qdrant()
