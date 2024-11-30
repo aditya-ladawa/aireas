@@ -41,6 +41,9 @@ import re
 import traceback
 
 
+from api.redis_ops import add_conversation, initialize_redis, close_redis_connection
+
+
 load_dotenv()
 
 # Services
@@ -130,7 +133,6 @@ app.add_middleware(
 )
 
 
-import traceback
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
@@ -174,21 +176,31 @@ async def global_exception_handler(request: Request, exc: Exception):
         content=error_detail,
     )
 
-# Define directories for file uploads
-static_dir = Path("api/static/")
-static_dir.mkdir(exist_ok=True)
+# # Define directories for file uploads
+# static_dir = Path("api/static/")
+# static_dir.mkdir(exist_ok=True)
 
 # metas_dir = "api/metas/"
 # os.makedirs(metas_dir, exist_ok=True)
 
-# Mount static files
-app.mount("/static", StaticFiles(directory=static_dir), name="static")
+# # Mount static files
+# app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 
-# Initialize the database at startup
+# Initialize the sql database at startup
 @app.on_event("startup")
-async def startup_event():
+async def sql_startup_event():
     await init_db()
+    print('\nStarted SQL db')
+
+# Initialize the redis database at startup
+@app.on_event("startup")
+async def redis_startup_event():
+    await initialize_redis()
+
+@app.on_event("shutdown")
+async def redis_shutdown_event():
+    await close_redis_connection()
 
 
 def get_authenticated_user(request: Request):
@@ -310,7 +322,7 @@ async def signup(user: UserCreate):
         )
 
     try:
-        new_user = create_user(
+        new_user = await create_user(
             user_name=user.name.strip(),
             raw_password=user.password,
             email=user.email.strip().lower(),
@@ -326,8 +338,6 @@ async def signup(user: UserCreate):
             status_code=500,
             detail="An unexpected error occurred during signup. Please try again later.",
         )
-
-
 
 @app.post("/api/login", status_code=200)
 async def login(user: UserLogin, response: Response):
@@ -376,19 +386,57 @@ async def logout(response: Response):
         raise HTTPException(status_code=500, detail=f"An error occurred during logout: {str(e)}")
 
 
-@app.post('/api/assign_topic')
-async def assign_topic(request: AssignTopic, current_user: dict = Depends(get_authenticated_user)):
+@app.post('/api/add_conversation')
+async def add_conversation_route(request: AssignTopic, current_user: dict = Depends(get_authenticated_user)):
+    """
+    API route to add a conversation.
+    """
     try:
-        query = request.query
-        if not query.strip():
-            raise HTTPException(status_code=400, detail="user_query is required and cannot be empty.")
+        # Extract user details from the authenticated user
+        user_id = current_user.get("user_id")
+        email = current_user.get("email")
 
-        assigned_topic = assign_chat_topic_chain.invoke(query)
+        if not user_id or not email:
+            raise HTTPException(status_code=400, detail="User ID or email is missing from the request.")
 
-        return {"assigned_topic": assigned_topic}
+        # Extract conversation details from the request body
+        name = request.conversation_name
+        description = request.conversation_description
+
+        if not name.strip() or not description.strip():
+            raise HTTPException(status_code=400, detail="Both conversation_name and conversation_description are required.")
+
+        assigned_topic = assign_chat_topic_chain.invoke(description)
+
+        # Add conversation to Redis
+        result = await add_conversation(user_id, email, name, description, assigned_topic)
+
+        # Return success message
+        return {
+            "message": "Conversation added successfully",
+            "conversation_id": result["conversation_id"],
+            "assigned_topic": assigned_topic
+        }
 
     except HTTPException as e:
         raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@app.get('/api/user_conversations')
+async def get_conversations_route(current_user: dict = Depends(get_authenticated_user)):
+    """
+    API route to retrieve all conversations for a user.
+    """
+    try:
+        # Extract user details
+        user_id = current_user["user_id"]
+
+        # Retrieve conversations from Redis
+        conversations = await get_user_conversations(user_id)
+
+        return {"conversations": conversations}
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
