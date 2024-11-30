@@ -47,14 +47,21 @@ def connect_to_qdrant():
                     collection_name="aireas-cloud",
                     vectors_config=models.VectorParams(size=768, distance=models.Distance.COSINE),
                 )
-                print("Collection 'aireas-cloud' created successfully.")
+                print("Collection 'aireas-cloud' created successfully.\n")
 
                 _qdrant_client.create_payload_index(
                     collection_name="aireas-cloud",
-                    field_name="pdf_id",
+                    field_name="user_id",
                     field_schema=models.PayloadSchemaType.KEYWORD,
                 )
-                print("Index created on 'pdf_id' field for efficient filtering.")
+
+                _qdrant_client.create_payload_index(
+                    collection_name="aireas-cloud",
+                    field_name="conversation_id",
+                    field_schema=models.PayloadSchemaType.KEYWORD,
+                )
+
+                print("\nIndex created on 'user_id' and 'conversation_id' fields for efficient filtering.\n")
             else:
                 print("Collection 'aireas-cloud' already exists.")
 
@@ -70,7 +77,7 @@ async def process_pdfs(files, qclient_, collection_name, emb_model, user_id, ema
     Process uploaded PDF files, extract text, generate embeddings, and upsert them into Qdrant.
     """
     uploaded_files_info = {}
-    errors = []  # List to collect errors
+    errors = []
 
     os.makedirs(user_dir, exist_ok=True)
 

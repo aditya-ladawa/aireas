@@ -209,6 +209,6 @@ def assign_chat_topic(llm):
 
     prompt_template = ChatPromptTemplate.from_template(template=template)
 
-    assign_chat_topic_chain = prompt_template | llm | StrOutputParser()
+    assign_chat_topic_chain = prompt_template | llm | (lambda x: x.content)
 
     return assign_chat_topic_chain
