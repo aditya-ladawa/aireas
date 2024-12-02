@@ -28,3 +28,7 @@ class Token(BaseModel):
 
 class TokenData(BaseModel):
     username: str | None = None
+
+class AssignTopic(BaseModel):
+    conversation_name: str
+    conversation_description: str

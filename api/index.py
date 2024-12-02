@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Response, Request, Query, status
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Response, Request, Query, status, WebSocket, WebSocketDisconnect
 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -13,6 +13,8 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from qdrant_client import QdrantClient
 
+from langchain_core.messages import HumanMessage, BaseMessage, AIMessage
+
 from typing import List
 
 from api.qdrant_cloud_ops import process_pdfs, qclient_, EMBEDDING_MODEL
@@ -22,7 +24,7 @@ from api.sql_ops import init_db, create_user, get_user_by_email, verify_password
 from fastapi.responses import JSONResponse
 from api.pydantic_models import *
 
-from api.chat_handlers import assign_chat_topic_chain
+from api.chat_handlers import assign_chat_topic_chain, llm, react_agent
 
 from fastapi.security import OAuth2PasswordBearer
 
@@ -41,8 +43,10 @@ import re
 import traceback
 
 
-from api.redis_ops import add_conversation, initialize_redis, close_redis_connection
+from api.redis_ops import add_conversation, initialize_redis, close_redis_connection, fetch_user_conversations, fetch_conversation, update_conversation_files
 
+
+from fastapi.responses import FileResponse
 
 load_dotenv()
 
@@ -212,21 +216,24 @@ def get_authenticated_user(request: Request):
     return request.state.user
 
 
-@app.post("/api/upload")
-async def upload_files(files: List[UploadFile] = File(...), current_user: dict = Depends(get_authenticated_user)):
+@app.post("/api/upload/{conversation_id}")
+async def upload_files(conversation_id: str, files: List[UploadFile] = File(...), current_user: dict = Depends(get_authenticated_user)):
     """
     Upload and process PDF files for the current authenticated user.
     """
     try:
-        # Retrieve user information from the current authenticated user
         user_id = current_user.get("user_id")
-        email = current_user.get("email")
+        email = current_user.get("email")  # Assuming email is in the user dict
+
         if not user_id or not email:
             raise HTTPException(status_code=401, detail="User authentication failed.")
 
         # Define the user's directory
         user_storage_base = os.path.join(APIS, "users_storage")
         user_dir = os.path.join(user_storage_base, user_id)
+        conversation_dir = os.path.join(user_dir, conversation_id)
+
+        os.makedirs(conversation_dir, exist_ok=True)
 
         # Process uploaded files
         result = await process_pdfs(
@@ -236,10 +243,25 @@ async def upload_files(files: List[UploadFile] = File(...), current_user: dict =
             emb_model=EMBEDDING_MODEL,
             user_id=user_id,
             email=email,
-            user_dir=user_dir,
+            conversation_dir=conversation_dir,
+            conversation_id=conversation_id
         )
 
-        return result
+        # Debugging: Print the result to inspect
+        print("Result from process_pdfs:", result)
+
+        if result and "uploaded_files" in result and result["uploaded_files"]:
+            uploaded_files = result["uploaded_files"]
+            # Call the update_conversation_files function to update the conversation in Redis
+            update_response = await update_conversation_files(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                uploaded_files=uploaded_files
+            )
+
+            return {"message": "Files uploaded and conversation updated successfully.", "details": uploaded_files}
+        else:
+            raise HTTPException(status_code=400, detail="No files were processed successfully.")
 
     except HTTPException as e:
         print(f"HTTPException: {e.detail}")
@@ -248,29 +270,47 @@ async def upload_files(files: List[UploadFile] = File(...), current_user: dict =
         print(f"Unexpected error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
-
-@app.get("/api/get_uploaded_files")
-async def get_files(current_user: dict = Depends(get_authenticated_user)):
+@app.get("/api/get_uploaded_files/{conversation_id}")
+async def get_uploaded_files(conversation_id: str, current_user: dict = Depends(get_authenticated_user)):
+    """
+    Retrieve uploaded files for a specific conversation and the current authenticated user.
+    """
     try:
-        # Retrieve user-specific storage directory
+        # Retrieve user-specific details
         user_id = current_user.get("user_id")
         if not user_id:
             raise HTTPException(status_code=401, detail="User authentication failed.")
 
+        # Define the conversation-specific directory
         user_storage_base = os.path.join(APIS, "users_storage")
         user_dir = os.path.join(user_storage_base, user_id)
+        conversation_dir = os.path.join(user_dir, conversation_id)
 
-        if not os.path.exists(user_dir):
-            return JSONResponse(content={"files": [], "message": "No files found."}, status_code=200)
+        # Check if the directory exists
+        if not os.path.exists(conversation_dir):
+            return JSONResponse(content={"files": [], "message": "No files found for this conversation."}, status_code=200)
 
+        # Retrieve all files within the conversation directory
         files = [
-            file for file in os.listdir(user_dir) if os.path.isfile(os.path.join(user_dir, file))
+            file for file in os.listdir(conversation_dir) if os.path.isfile(os.path.join(conversation_dir, file))
         ]
 
-        return JSONResponse(content={"files": files}, status_code=200)
+        if not files:
+            return JSONResponse(content={"files": [], "message": "No files found for this conversation."}, status_code=200)
 
+        # Prepare a detailed response with file paths
+        file_details = [
+            {"file_name": file, "file_path": os.path.join(conversation_dir, file)} for file in files
+        ]
+
+        return JSONResponse(content={"files": file_details, "message": "Files retrieved successfully."}, status_code=200)
+
+    except HTTPException as e:
+        print(f"HTTPException: {e.detail}")
+        raise
     except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        print(f"Unexpected error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
 
 @app.post('/api/retrieve')
@@ -392,6 +432,7 @@ async def add_conversation_route(request: AssignTopic, current_user: dict = Depe
     API route to add a conversation.
     """
     try:
+        
         # Extract user details from the authenticated user
         user_id = current_user.get("user_id")
         email = current_user.get("email")
@@ -423,21 +464,62 @@ async def add_conversation_route(request: AssignTopic, current_user: dict = Depe
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-@app.get('/api/user_conversations')
-async def get_conversations_route(current_user: dict = Depends(get_authenticated_user)):
-    """
-    API route to retrieve all conversations for a user.
-    """
+@app.get('/api/fetch_conversations')
+async def fetch_conversations(current_user: dict = Depends(get_authenticated_user)):
+    user_id = current_user.get("user_id")
+    user_email = current_user.get("email")
+
+    if not user_id or not user_email:
+        raise HTTPException(status_code=400, detail="Invalid user details.")
+
+    conversations = await fetch_user_conversations(user_id)
+
+    if not conversations:
+        return {"message": "No conversations found.", "conversations": []}
+
+    return {"conversations": conversations}
+
+
+@app.get("/api/conversations/{conversation_id}")
+async def get_conversation(conversation_id: str,  current_user: str = Depends(get_authenticated_user)):
+    user_id = current_user.get("user_id")
+    return await fetch_conversation(user_id=user_id, conversation_id=conversation_id)
+
+
+@app.get("/api/view_pdf/{conversation_id}/{file_name}")
+async def view_pdf(conversation_id: str, file_name: str, current_user: dict = Depends(get_authenticated_user)):
+    user_id = current_user.get('user_id')
+    selected_file_path = os.path.join(APIS, 'users_storage', user_id, conversation_id, file_name)
+
+    if not os.path.exists(selected_file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    # Use FileResponse and specify headers for inline display
+    return FileResponse(
+        selected_file_path,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{file_name}"'}
+    )
+
+
+@app.websocket("/api/llm_chat")
+async def websocket_llm_chat(websocket: WebSocket):
+    """WebSocket endpoint for real-time LLM interaction."""
+    await websocket.accept()
     try:
-        # Extract user details
-        user_id = current_user["user_id"]
+        await websocket.send_text("Connected to LLM WebSocket! Start sending your queries.")
+        
+        while True:
+            user_query = await websocket.receive_text()
+            print(f"User Query: {user_query}")
 
-        # Retrieve conversations from Redis
-        conversations = await get_user_conversations(user_id)
+            query = {'messages': [HumanMessage(content=user_query)]}
 
-        return {"conversations": conversations}
+            agent_invoke = react_agent.invoke(query)
+            agent_response = agent_invoke['messages'][-1].content
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+            await websocket.send_text(agent_response)
+    except WebSocketDisconnect:
+        print("WebSocket connection closed.")
 
 

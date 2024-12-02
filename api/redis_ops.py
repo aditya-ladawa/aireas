@@ -2,6 +2,7 @@ import uuid
 from datetime import datetime
 import redis.asyncio as redis
 import json
+from typing_extensions import List
 
 redis_client = None  # Global Redis client for shared use
 
@@ -59,3 +60,88 @@ async def add_conversation(user_id: str, email: str, name: str, description: str
         "conversation_data": conversation_data,
     }
 
+
+async def fetch_user_conversations(user_id: str) -> list:
+    user_conversations_key = f"user:{user_id}:conversations"
+    conversations_data = await redis_client.hgetall(user_conversations_key)
+
+    if not conversations_data:
+        return []
+
+    conversations = []
+    for conversation_id, conversation_json in conversations_data.items():
+        try:
+            conversation = json.loads(conversation_json)
+            conversation["id"] = conversation_id
+            # Format the timestamp
+            if 'timestamp' in conversation:
+                timestamp = datetime.fromisoformat(conversation['timestamp'])
+                conversation['created_at'] = timestamp.strftime('%Y-%m-%d %H:%M')
+                del conversation['timestamp']
+            conversations.append(conversation)
+        except json.JSONDecodeError:
+            continue  # Skip invalid JSON
+
+    return conversations
+
+
+async def fetch_conversation(user_id: str, conversation_id: str) -> dict:
+    user_conversations_key = f"user:{user_id}:conversations"
+    conversation_json = await redis_client.hget(user_conversations_key, conversation_id)
+    
+    if conversation_json is None:
+        raise ValueError(f"Conversation with ID {conversation_id} not found for user {user_id}.")
+
+    try:
+        conversation = json.loads(conversation_json)
+        conversation["id"] = conversation_id
+
+        if 'timestamp' in conversation:
+            timestamp = datetime.fromisoformat(conversation['timestamp'])
+            conversation['created_at'] = timestamp.strftime('%Y-%m-%d %H:%M')
+            del conversation['timestamp']
+        
+        return conversation
+
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Error decoding conversation data: {str(e)}")
+
+
+async def update_conversation_files(user_id: str, conversation_id: str, uploaded_files):
+    """
+    Update the conversation files for a specific user and conversation ID.
+    If a file with the same name already exists, replace its information with the new data.
+    """
+    user_conversations_key = f"user:{user_id}:conversations"
+
+    # Fetch the existing conversation data from Redis
+    conversation_json = await redis_client.hget(user_conversations_key, conversation_id)
+    if not conversation_json:
+        raise ValueError(f"Conversation with ID {conversation_id} not found for user {user_id}.")
+
+    try:
+        conversation_data = json.loads(conversation_json)
+
+        # Load existing files data or initialize as empty
+        files_data = json.loads(conversation_data.get("files", "{}"))
+
+        for file_info in uploaded_files.values():
+            file_name = file_info["file_name"]
+            file_path = file_info["file_path"]
+
+            # Replace or add the file's information
+            files_data[file_name] = {
+                "file_path": file_path,
+                "upload_timestamp": file_info["timestamp"],  # Ensure the key is 'timestamp'
+            }
+
+        # Update the conversation data with the new files
+        conversation_data["files"] = json.dumps(files_data)
+
+        # Save the updated conversation data back to Redis
+        await redis_client.hset(user_conversations_key, conversation_id, json.dumps(conversation_data))
+
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Error decoding conversation data: {str(e)}")
+
+    return {"message": "Conversation files updated successfully."}

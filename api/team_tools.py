@@ -2,7 +2,7 @@ from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
 from langchain.tools.retriever import create_retriever_tool
-from langchain.agents import load_tools
+from langchain_community.agent_toolkits.load_tools import load_tools
 from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_community.document_loaders import WebBaseLoader
 from langchain_experimental.utilities import PythonREPL
@@ -11,7 +11,7 @@ from typing import List, Annotated
 from qdrant_client import QdrantClient
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_core.tools import StructuredTool, ToolException
-from qdrant_cloud_ops import connect_to_qdrant
+from api.qdrant_cloud_ops import connect_to_qdrant
 
 client = connect_to_qdrant()
 COLLECTION_NAME = 'aireas-cloud'
