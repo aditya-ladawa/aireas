@@ -13,7 +13,7 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from qdrant_client import QdrantClient
 
-from langchain_core.messages import HumanMessage, BaseMessage, AIMessage
+from langchain_core.messages import HumanMessage, BaseMessage, AIMessage, ToolMessage
 
 from typing import List
 
@@ -71,70 +71,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Define the UserAuthMiddleware class
-class UserAuthMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app, secret_key: str, algorithm: str):
-        super().__init__(app)
-        self.secret_key = secret_key
-        self.algorithm = algorithm
-
-    async def dispatch(self, request: Request, call_next):
-        unprotected_routes = [
-            "/api/login",
-            "/api/signup",
-            "/api/logout",
-            "/api/docs",
-            "/api/openapi.json",
-        ]
-
-        # Allow unprotected routes without authentication
-        for route in unprotected_routes:
-            if re.fullmatch(route, request.url.path):
-                response = await call_next(request)
-                return response
-
-        # Example regex for routes to skip authentication
-        if re.fullmatch(r"/api/.*/\w+", request.url.path):
-            response = await call_next(request)
-            return response
-
-        # Extract token from cookies
-        token = request.cookies.get("auth_token")
-        if not token:
-            raise HTTPException(status_code=401, detail="Not authenticated")
-
-        try:
-            payload = decode(token, self.secret_key, algorithms=[self.algorithm])
-            exp = payload.get("exp")
-            if exp and datetime.utcfromtimestamp(exp) < datetime.utcnow():
-                raise HTTPException(status_code=401, detail="Token has expired")
-
-            # Add user data to request state
-            user = {
-                "user_id": payload.get("user_id"),
-                "email": payload.get("email"),
-            }
-            request.state.user = user
-
-        except ExpiredSignatureError as e:
-            raise HTTPException(status_code=401, detail=f"Token expired: {str(e)}")
-        except InvalidTokenError as e:
-            raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
-        except DecodeError as e:
-            raise HTTPException(status_code=400, detail=f"Malformed token: {str(e)}")
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
-
-        # Continue to the next middleware or route handler
-        response = await call_next(request)
-        return response
-
-# Add UserAuthMiddleware to the application
-app.add_middleware(
-    UserAuthMiddleware,
-    secret_key=SECRET_KEY,
-    algorithm=ALGORITHM,
-)
 
 
 
@@ -208,12 +144,30 @@ async def redis_shutdown_event():
 
 
 def get_authenticated_user(request: Request):
-    if not request.state.user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated",
-        )
-    return request.state.user
+    token = request.cookies.get("auth_token")
+    if not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+
+    try:
+        payload = decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        exp = payload.get("exp")
+        
+        if exp and datetime.utcfromtimestamp(exp) < datetime.utcnow():
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has expired")
+
+        return {
+            "user_id": payload.get("user_id"),
+            "email": payload.get("email"),
+        }
+
+    except ExpiredSignatureError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired")
+    except InvalidTokenError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+    except DecodeError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Malformed token")
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Unexpected error: {str(e)}")
 
 
 @app.post("/api/upload/{conversation_id}")
@@ -269,6 +223,7 @@ async def upload_files(conversation_id: str, files: List[UploadFile] = File(...)
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+
 
 @app.get("/api/get_uploaded_files/{conversation_id}")
 async def get_uploaded_files(conversation_id: str, current_user: dict = Depends(get_authenticated_user)):
@@ -379,6 +334,7 @@ async def signup(user: UserCreate):
             detail="An unexpected error occurred during signup. Please try again later.",
         )
 
+
 @app.post("/api/login", status_code=200)
 async def login(user: UserLogin, response: Response):
     try:
@@ -402,6 +358,7 @@ async def login(user: UserLogin, response: Response):
         raise HTTPException(status_code=500, detail="Database error")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+
 
 @app.get('/api/get_auth_user')
 async def get_active_user(current_user: dict = Depends(get_authenticated_user)):
@@ -464,6 +421,7 @@ async def add_conversation_route(request: AssignTopic, current_user: dict = Depe
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
+
 @app.get('/api/fetch_conversations')
 async def fetch_conversations(current_user: dict = Depends(get_authenticated_user)):
     user_id = current_user.get("user_id")
@@ -502,24 +460,70 @@ async def view_pdf(conversation_id: str, file_name: str, current_user: dict = De
     )
 
 
-@app.websocket("/api/llm_chat")
-async def websocket_llm_chat(websocket: WebSocket):
-    """WebSocket endpoint for real-time LLM interaction."""
+async def get_authenticated_user_websocket(websocket: WebSocket):
+    token = websocket.cookies.get("auth_token")
+
+    if not token:
+        raise HTTPException(status_code=401, detail="Authorization token missing")
+
+    try:
+        payload = decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+
+        exp = payload.get("exp")
+        if exp and datetime.utcfromtimestamp(exp) < datetime.utcnow():
+            raise HTTPException(status_code=401, detail="Token has expired")
+
+        return {
+            "user_id": payload.get("user_id"),
+            "email": payload.get("email"),
+        }
+
+    except ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired")
+    except InvalidTokenError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
+
+@app.websocket("/api/llm_chat/{conversation_id}")
+async def websocket_llm_chat(conversation_id: str, websocket: WebSocket, current_user: dict = Depends(get_authenticated_user_websocket)):
+    user_id = current_user.get('user_id')
+    config = {"configurable": {'user_id': user_id ,"conversation_id": conversation_id}}
     await websocket.accept()
     try:
         await websocket.send_text("Connected to LLM WebSocket! Start sending your queries.")
-        
+
+        seen_tool_calls = set()
+
         while True:
             user_query = await websocket.receive_text()
-            print(f"User Query: {user_query}")
 
             query = {'messages': [HumanMessage(content=user_query)]}
 
-            agent_invoke = react_agent.invoke(query)
-            agent_response = agent_invoke['messages'][-1].content
+            async for event in react_agent.astream(query, stream_mode='values', config=config):
+                if 'messages' not in event:
+                    continue
 
-            await websocket.send_text(agent_response)
+                for msg in event['messages']:
+                    if isinstance(msg, HumanMessage):
+                        continue
+
+                    elif isinstance(msg, AIMessage) and not msg.content:
+                        tool_calls = msg.additional_kwargs['tool_calls']
+
+                        for tool_call in tool_calls:
+                            tool_name = tool_call['function']['name']
+                            args = tool_call['function']['arguments']
+
+                            tool_call_id = (tool_name, str(args))
+                            if tool_call_id not in seen_tool_calls:
+                                seen_tool_calls.add(tool_call_id)
+                                await websocket.send_text(f"Calling tool: {tool_name}\nTool arguments: {args}")
+
+                    elif isinstance(msg, AIMessage):
+                        if msg.content:
+                            await websocket.send_text(msg.content)
+
     except WebSocketDisconnect:
         print("WebSocket connection closed.")
-
-
